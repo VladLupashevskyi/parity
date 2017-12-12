@@ -166,7 +166,10 @@ struct Importer {
 	pub engine: Arc<EthEngine>,
 
 	// WARNING: circle reference may lead to a resource leak
-	client: Arc<Client>,
+	// client: Arc<Client>,
+
+	// TODO ClientReport?
+	// TODO TraceDB?
 }
 
 /// Blockchain database client backed by a persistent database. Owns and manages a blockchain and a block queue.
@@ -230,17 +233,13 @@ pub struct Client {
 	importer: Importer,
 }
 
-impl Nonce for Importer {
-
-}
-
 impl Importer {
 	pub fn new(
 		config: &ClientConfig,
 		engine: Arc<EthEngine>,
 		message_channel: IoChannel<ClientIoMessage>,
 		miner: Arc<Miner>,
-		client: Arc<Client>,
+		// client: Arc<Client>,
 	) -> Result<Importer, ::error::Error> {
 		let block_queue = BlockQueue::new(config.queue.clone(), engine.clone(), message_channel.clone(), config.verifier_type.verifying_seal());
 
@@ -378,7 +377,7 @@ impl Importer {
 				let (enacted, retracted) = self.calculate_enacted_retracted(&import_results);
 
 				if is_empty {
-					self.miner.chain_new_blocks(self, &imported_blocks, &invalid_blocks, &enacted, &retracted);
+					self.miner.chain_new_blocks(client, &imported_blocks, &invalid_blocks, &enacted, &retracted);
 				}
 
 				client.notify(|notify| {
@@ -399,14 +398,22 @@ impl Importer {
 		imported
 	}
 
-	/*fn check_and_close_block(&self, block: &PreverifiedBlock) -> Result<LockedBlock, ()> {
-		let engine = &*self.engine;
+	fn check_and_close_block(&self,
+		block: &PreverifiedBlock,
+		pruning_info: &PruningInfo,
+		chain: &BlockChain,
+		state_db: &StateDB,
+		trace_db: &TraceDB<BlockChain>,
+		factories: Factories,
+		engine: &EthEngine,
+		last_hashes: Arc<LastHashes>,
+	) -> Result<LockedBlock, ()> {
+		//let engine = &*self.engine;
 		let header = &block.header;
 
-		let chain = self.chain.read();
 		// Check the block isn't so old we won't be able to enact it.
 		let best_block_number = chain.best_block_number();
-		if self.pruning_info().earliest_state > header.number() {
+		if pruning_info.earliest_state > header.number() {
 			warn!(target: "client", "Block import failed for #{} ({})\nBlock is ancient (current best block: #{}).", header.number(), header.hash(), best_block_number);
 			return Err(());
 		}
@@ -425,7 +432,7 @@ impl Importer {
 			header,
 			&parent,
 			engine,
-			Some((&block.bytes, &block.transactions, &**chain, self)),
+			Some((&block.bytes, &block.transactions, chain, self)), // code_hash, call_contract
 		);
 
 		if let Err(e) = verify_family_result {
@@ -440,24 +447,25 @@ impl Importer {
 		};
 
 		// Enact Verified Block
-		let last_hashes = self.build_last_hashes(header.parent_hash().clone());
-		let db = self.state_db.lock().boxed_clone_canon(header.parent_hash());
+		// let last_hashes = self.build_last_hashes(header.parent_hash().clone());
+		let db = state_db.boxed_clone_canon(header.parent_hash());
 
 		let is_epoch_begin = chain.epoch_transition(parent.number(), *header.parent_hash()).is_some();
 		let enact_result = enact_verified(block,
 			engine,
-			self.tracedb.read().tracing_enabled(),
+			trace_db.tracing_enabled(),
 			db,
 			&parent,
 			last_hashes,
-			self.factories.clone(),
+			factories,
 			is_epoch_begin,
 		);
+
 		let mut locked_block = enact_result.map_err(|e| {
 			warn!(target: "client", "Block import failed for #{} ({})\nError: {:?}", header.number(), header.hash(), e);
 		})?;
 
-		if header.number() < self.engine().params().validate_receipts_transition && header.receipts_root() != locked_block.block().header().receipts_root() {
+		if header.number() < engine.params().validate_receipts_transition && header.receipts_root() != locked_block.block().header().receipts_root() {
 			locked_block = locked_block.strip_receipts();
 		}
 
@@ -468,7 +476,74 @@ impl Importer {
 		}
 
 		Ok(locked_block)
-	}*/
+	}
+
+	// NOTE: the header of the block passed here is not necessarily sealed, as
+	// it is for reconstructing the state transition.
+	//
+	// The header passed is from the original block data and is sealed.
+	fn commit_block<B>(&self, block: B, header: &Header, block_data: &[u8], chain: &BlockChain) -> ImportRoute where B: IsBlock + Drain {
+		let hash = &header.hash();
+		let number = header.number();
+		let parent = header.parent_hash();
+		// let chain = self.chain.read();
+
+		// Commit results
+		let receipts = block.receipts().to_owned();
+		let traces = block.traces().clone().unwrap_or_else(Vec::new);
+		let traces: Vec<FlatTransactionTraces> = traces.into_iter()
+			.map(Into::into)
+			.collect();
+
+		assert_eq!(header.hash(), BlockView::new(block_data).header_view().hash());
+
+		//let traces = From::from(block.traces().clone().unwrap_or_else(Vec::new));
+
+		let mut batch = DBTransaction::new();
+
+		// CHECK! I *think* this is fine, even if the state_root is equal to another
+		// already-imported block of the same number.
+		// TODO: Prove it with a test.
+		let mut state = block.drain();
+
+		// check epoch end signal, potentially generating a proof on the current
+		// state.
+		self.check_epoch_end_signal(
+			&header,
+			block_data,
+			&receipts,
+			&state,
+			&chain,
+			&mut batch,
+		);
+
+		state.journal_under(&mut batch, number, hash).expect("DB commit failed");
+		let route = chain.insert_block(&mut batch, block_data, receipts.clone());
+
+		self.tracedb.read().import(&mut batch, TraceImportRequest {
+			traces: traces.into(),
+			block_hash: hash.clone(),
+			block_number: number,
+			enacted: route.enacted.clone(),
+			retracted: route.retracted.len()
+		});
+
+		let is_canon = route.enacted.last().map_or(false, |h| h == hash);
+		state.sync_cache(&route.enacted, &route.retracted, is_canon);
+		// Final commit to the DB
+		self.db.read().write_buffered(batch);
+		chain.commit();
+
+		self.check_epoch_end(&header, &chain);
+
+		self.update_last_hashes(&parent, hash);
+
+		if let Err(e) = self.prune_ancient(state, &chain) {
+			warn!("Failed to prune ancient state data: {}", e);
+		}
+
+		route
+	}
 
 	fn calculate_enacted_retracted(&self, import_results: &[ImportRoute]) -> (Vec<H256>, Vec<H256>) {
 		fn map_to_vec(map: Vec<(H256, bool)>) -> Vec<H256> {
